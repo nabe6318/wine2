@@ -28,7 +28,7 @@ st.markdown("""
 if "step" not in st.session_state:
     st.session_state.step = 1
 
-def go(step):
+def go(step: int):
     st.session_state.step = step
 
 def next_step():
@@ -72,7 +72,7 @@ if st.session_state.step == 1:
 
     # 先頭5行（固定プレビュー）
     st.subheader("先頭5行 / First 5 rows")
-    st.table(df.head(5))  # 固定表示に最適
+    st.table(df.head(5))
 
     # 全データ（スクロール可能なテーブル）
     st.subheader("全データ（スクロール可）/ Full dataset (scrollable)")
@@ -80,14 +80,14 @@ if st.session_state.step == 1:
 
     c1, c2 = st.columns([1,1])
     with c1:
-        st.button("▶ 次へ / Next", on_click=next_step)
+        st.button("▶ 次へ / Next", on_click=next_step, key="s1_next")
     with c2:
-        st.button("🔄 リセット / Reset", on_click=lambda: go(1))
+        st.button("🔄 リセット / Reset", on_click=lambda: go(1), key="s1_reset")
 
 # =========================
 # STEP 2: Feature selection
 # =========================
-if st.session_state.step >= 2:
+if st.session_state.step == 2:
     st.header("Step 2: 説明変数の選択 / Select Features")
 
     with st.expander("説明 / Explanation", expanded=True):
@@ -103,29 +103,31 @@ if st.session_state.step >= 2:
 
     colA, colB = st.columns(2)
     with colA:
-        if st.button("🟩 全選択 / Select All"):
+        if st.button("🟩 全選択 / Select All", key="s2_select_all"):
             st.session_state.selected_features = feature_names.copy()
     with colB:
-        if st.button("⬜ 全解除 / Clear All"):
+        if st.button("⬜ 全解除 / Clear All", key="s2_clear_all"):
             st.session_state.selected_features = []
 
     selected_features = st.multiselect(
         "使用する説明変数 / Features to use",
         options=feature_names,
         default=st.session_state.selected_features,
-        key="selected_features"
+        key="s2_multiselect",
     )
+    # Keep session in sync
+    st.session_state.selected_features = selected_features
 
     nav1, nav2 = st.columns([1,1])
     with nav1:
-        st.button("◀ 戻る / Back", on_click=prev_step)
+        st.button("◀ 戻る / Back", on_click=prev_step, key="s2_back")
     with nav2:
-        st.button("▶ 次へ / Next", on_click=next_step, disabled=(len(selected_features) == 0))
+        st.button("▶ 次へ / Next", on_click=next_step, disabled=(len(selected_features) == 0), key="s2_next")
 
 # =========================
 # STEP 3: Model settings
 # =========================
-if st.session_state.step >= 3:
+if st.session_state.step == 3:
     st.header("Step 3: モデル設定 / Model Settings")
 
     with st.expander("説明 / Explanation", expanded=True):
@@ -141,17 +143,18 @@ if st.session_state.step >= 3:
             "不純度指標 / Criterion",
             options=["gini", "entropy"],
             index=0,
-            help="gini=ジニ係数, entropy=情報利得 / gini=Gini impurity, entropy=Information gain"
+            help="gini=ジニ係数, entropy=情報利得 / gini=Gini impurity, entropy=Information gain",
+            key="s3_criterion",
         )
         max_depth = st.number_input(
             "決定木の最大深さ（0=制限なし）/ Max depth (0 = unlimited)",
-            min_value=0, max_value=50, value=3, step=1
+            min_value=0, max_value=50, value=3, step=1, key="s3_max_depth"
         )
         random_state = st.number_input(
             "random_state（再現性）/ random_state",
-            min_value=0, max_value=9999, value=0, step=1
+            min_value=0, max_value=9999, value=0, step=1, key="s3_random_state"
         )
-        submitted = st.form_submit_button("設定を確定して次へ / Apply & Next ▶")
+        submitted = st.form_submit_button("設定を確定して次へ / Apply & Next ▶", use_container_width=True)
 
     if submitted:
         st.session_state.criterion = criterion
@@ -159,12 +162,12 @@ if st.session_state.step >= 3:
         st.session_state.random_state = random_state
         next_step()
 
-    st.button("◀ 戻る / Back", on_click=prev_step)
+    st.button("◀ 戻る / Back", on_click=prev_step, key="s3_back")
 
 # =========================
 # STEP 4: Train & evaluate
 # =========================
-if st.session_state.step >= 4:
+if st.session_state.step == 4:
     st.header("Step 4: 学習・評価・可視化 / Train, Evaluate & Visualize")
 
     with st.expander("説明 / Explanation", expanded=True):
@@ -176,7 +179,7 @@ if st.session_state.step >= 4:
 """)
 
     # Gather settings & data
-    selected_features = st.session_state.selected_features
+    selected_features = st.session_state.get("selected_features", feature_names)
     if len(selected_features) == 0:
         st.error("説明変数が選択されていません。Step 2 に戻って選択してください。 / No features selected. Please go back to Step 2.")
         st.stop()
@@ -243,10 +246,11 @@ if st.session_state.step >= 4:
 
     nav1, nav2, nav3 = st.columns(3)
     with nav1:
-        st.button("◀ 戻る（設定）/ Back (Settings)", on_click=prev_step)
+        st.button("◀ 戻る（設定）/ Back (Settings)", on_click=prev_step, key="s4_back")
     with nav2:
-        st.button("⏮ 最初に戻る / Back to Step 1", on_click=lambda: go(1))
+        st.button("⏮ 最初に戻る / Back to Step 1", on_click=lambda: go(1), key="s4_to_s1")
     with nav3:
-        st.button("🔄 再実行 / Rerun", on_click=lambda: go(4))
+        st.button("🔄 再実行 / Rerun", on_click=lambda: go(4), key="s4_rerun")
+
 
 

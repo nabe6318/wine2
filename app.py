@@ -2,25 +2,78 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from io import BytesIO
 
-from sklearn.tree import DecisionTreeClassifier, plot_tree, export_graphviz
+from sklearn.tree import DecisionTreeClassifier, plot_tree
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.preprocessing import LabelEncoder
 
-st.set_page_config(page_title="ワインデータ決定木（CSV/Streamlit）", layout="wide")
-st.title("🍷 決定木 可視化アプリ（CSV対応 / Streamlit Cloud）")
+# -----------------------------
+# 基本設定
+# -----------------------------
+st.set_page_config(page_title="🍷 決定木（CSV読み込み／ステップ実行）", layout="wide")
+st.title("🍷 決定木学習（CSV読み込み / ステップ実行）")
 
 st.markdown("""
-- 左側で CSV をアップロードし、目的変数（ターゲット）と特徴量（説明変数）を選びます  
-- `Graphviz` は不要（Streamlit Cloud で動作）  
-- 決定木の**PNG画像**と**Graphviz DOT**をダウンロード可能
+**使い方（順番に実行）**  
+1) サイドバーでCSVをアップロード（ヘッダ行あり）。  
+2) 目的変数（ターゲット）は自動検出します（UIには表示しません）。  
+3) 使用する説明変数を選択（初期値は全選択）。  
+4) 不純度指標（ジニ係数/エントロピー）と決定木の最大深さを設定。  
+5) 学習を実行して結果を確認。  
 """)
 
-# ---------- ユーティリティ ----------
+# -----------------------------
+# セッション状態（ステップ管理）
+# -----------------------------
+if "step" not in st.session_state:
+    st.session_state.step = 1
+
+def go_next():
+    st.session_state.step += 1
+
+def go_prev():
+    st.session_state.step = max(1, st.session_state.step - 1)
+
+# -----------------------------
+# 目的変数の自動検出
+# -----------------------------
+TARGET_CANDIDATES = ["target", "class", "label", "y", "species"]
+
+def detect_target_column(df: pd.DataFrame) -> str | None:
+    for name in TARGET_CANDIDATES:
+        if name in df.columns:
+            return name
+    # 見つからなければ最終列をターゲットとみなす（明示的にCSV末尾に置いてください）
+    if df.shape[1] >= 2:
+        return df.columns[-1]
+    return None
+
+def encode_target(y_series: pd.Series):
+    """目的変数を分類用にエンコード。連続値（クラス数>20など）はエラーを返す。"""
+    nunique = y_series.nunique(dropna=True)
+    class_names = None
+    y_encoder = None
+
+    # 文字列 or カテゴリ → LabelEncode
+    if not pd.api.types.is_numeric_dtype(y_series):
+        y_encoder = LabelEncoder()
+        y = y_encoder.fit_transform(y_series.astype(str))
+        class_names = [str(c) for c in y_encoder.classes_]
+        return y, class_names, y_encoder
+
+    # 数値：クラス数が少なければ離散ラベルとみなす
+    if nunique <= 20:
+        classes_sorted = sorted(y_series.dropna().unique())
+        mapping = {v: i for i, v in enumerate(classes_sorted)}
+        y = y_series.map(mapping).values
+        class_names = [str(c) for c in classes_sorted]
+        return y, class_names, None
+
+    # 連続値っぽい → 分類木には不適
+    return None, None, None
+
 def encode_features(df: pd.DataFrame, feature_cols):
-    """特徴量の非数値列を LabelEncoder で数値化（学習用）。戻り値: X, encoders(dict)"""
     X = df[feature_cols].copy()
     encoders = {}
     for col in feature_cols:
@@ -30,220 +83,176 @@ def encode_features(df: pd.DataFrame, feature_cols):
             encoders[col] = le
     return X, encoders
 
-def encode_target(y_series: pd.Series):
-    """目的変数をエンコード。カテゴリ/少数離散値は LabelEncoder、それ以外はそのまま（分類前提のチェック別）。"""
-    class_names = None
-    y_encoder = None
 
-    # 目的変数のユニーク数
-    nunique = y_series.nunique(dropna=True)
+# -----------------------------
+# ステップ1: CSVアップロード & ターゲット自動検出
+# -----------------------------
+st.sidebar.header("📥 ステップ1：CSVアップロード")
+uploaded = st.sidebar.file_uploader("CSVファイル（ヘッダ行あり）を選択", type=["csv"])
 
-    # 非数値は LabelEncode
-    if not pd.api.types.is_numeric_dtype(y_series):
-        y_encoder = LabelEncoder()
-        y = y_encoder.fit_transform(y_series.astype(str))
-        class_names = [str(c) for c in y_encoder.classes_]
-        return y, y_encoder, class_names
-
-    # 数値だが「離散っぽい」場合（クラス数が多すぎない）
-    if nunique <= 20:
-        # 0..K-1に並び替え
-        classes_sorted = sorted(y_series.dropna().unique())
-        mapping = {v: i for i, v in enumerate(classes_sorted)}
-        y = y_series.map(mapping).values
-        y_encoder = None
-        class_names = [str(c) for c in classes_sorted]
-        return y, y_encoder, class_names
-
-    # 連続値っぽい（分類木には不向き）
-    return None, None, None
-
-# ---------- データ入力 ----------
-with st.sidebar:
-    st.header("📥 データ入力")
-    uploaded = st.file_uploader("CSVをアップロード（ヘッダ行あり想定）", type=["csv"])
-    use_sample = st.checkbox("サンプル（sklearn wine）を使う", value=(uploaded is None))
-
-if use_sample:
-    # sklearnのワインデータをそのままDataFrame化
-    from sklearn.datasets import load_wine
-    wine = load_wine(as_frame=True)
-    df = wine.frame.copy()  # features + target
-    # target 名は数値。別途名前リストは wine.target_names
-    st.caption("サンプル：sklearn wine データ")
-else:
+if st.session_state.step == 1:
+    st.subheader("ステップ1：データの読み込み")
     if uploaded is None:
-        st.info("CSVをアップロードするか、サンプルデータを使用してください。")
+        st.info("CSV をアップロードしてください。")
+    else:
+        df = pd.read_csv(uploaded)
+        st.write(f"行数: **{len(df)}**, 列数: **{df.shape[1]}**")
+        st.dataframe(df.head(), use_container_width=True)
+
+        target_col = detect_target_column(df)
+        if target_col is None:
+            st.error("目的変数（ターゲット）を自動検出できませんでした。"
+                     f" 列名に {TARGET_CANDIDATES} のいずれかを使うか、ターゲット列をファイルの最終列に置いてください。")
+        else:
+            st.success(f"目的変数（ターゲット）: **{target_col}**（自動検出）")
+            st.caption("※ 目的変数は特徴量選択から自動的に除外されます。UIには表示しません。")
+            if st.button("次へ ▶"):
+                st.session_state.df = df
+                st.session_state.target_col = target_col
+                st.session_state.step = 2
+
+# -----------------------------
+# ステップ2: 特徴量選択
+# -----------------------------
+if st.session_state.step >= 2 and "df" in st.session_state:
+    df = st.session_state.df
+    target_col = st.session_state.target_col
+    st.subheader("ステップ2：使用する説明変数の選択")
+
+    feature_candidates = [c for c in df.columns if c != target_col]
+
+    # 初期値は全選択
+    default_features = feature_candidates.copy()
+    if "selected_features" not in st.session_state:
+        st.session_state.selected_features = default_features
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🟩 全選択"):
+            st.session_state.selected_features = feature_candidates.copy()
+    with col2:
+        if st.button("⬜ 全解除"):
+            st.session_state.selected_features = []
+
+    selected_features = st.multiselect(
+        "説明変数（複数選択）", options=feature_candidates,
+        default=st.session_state.selected_features, key="selected_features"
+    )
+
+    if len(selected_features) == 0:
+        st.warning("少なくとも1つの説明変数を選んでください。")
+    colp = st.columns(2)
+    with colp[0]:
+        if st.button("◀ 戻る"):
+            go_prev()
+    with colp[1]:
+        if st.button("次へ ▶", disabled=(len(selected_features) == 0)):
+            st.session_state.step = 3
+
+# -----------------------------
+# ステップ3: モデル設定（ジニ係数・深さ）
+# -----------------------------
+if st.session_state.step >= 3 and "df" in st.session_state:
+    st.subheader("ステップ3：モデル設定")
+    st.caption("不純度指標はデフォルトで **gini（ジニ係数）** を使用します。必要に応じて変更してください。")
+
+    with st.form("model_settings"):
+        criterion = st.radio("不純度指標", options=["gini", "entropy"], index=0,
+                             help="gini=ジニ係数, entropy=情報利得")
+        max_depth = st.number_input("決定木の最大深さ（0=制限なし）", min_value=0, max_value=50, value=3, step=1)
+        random_state = st.number_input("random_state（再現性）", min_value=0, max_value=9999, value=0, step=1)
+        submitted = st.form_submit_button("設定を確定して次へ ▶")
+
+    if submitted:
+        st.session_state.criterion = criterion
+        st.session_state.max_depth = max_depth
+        st.session_state.random_state = random_state
+        st.session_state.step = 4
+
+    if st.button("◀ 戻る（特徴量選択へ）"):
+        go_prev()
+
+# -----------------------------
+# ステップ4: 学習・評価・可視化
+# -----------------------------
+if st.session_state.step >= 4 and "df" in st.session_state:
+    st.subheader("ステップ4：学習・評価・可視化")
+
+    df = st.session_state.df
+    target_col = st.session_state.target_col
+    selected_features = st.session_state.selected_features
+    criterion = st.session_state.criterion
+    depth = None if st.session_state.max_depth == 0 else int(st.session_state.max_depth)
+    random_state = int(st.session_state.random_state)
+
+    # 欠損除去（目的変数＋説明変数）
+    work_df = df[selected_features + [target_col]].dropna()
+    dropped = len(df) - len(work_df)
+    if dropped > 0:
+        st.caption(f"⚠️ 欠損値を含む {dropped} 行を除外しました。学習対象: {len(work_df)} 行")
+
+    # 目的変数エンコード
+    y_raw = work_df[target_col]
+    y, class_names, y_encoder = encode_target(y_raw)
+    if y is None:
+        st.error("目的変数が連続値（クラス数が多すぎ）と判断されました。分類木には不適です。"
+                 " ターゲットはカテゴリ（または少数の離散値）にしてください。")
         st.stop()
-    df = pd.read_csv(uploaded)
 
-st.subheader("🔎 データプレビュー")
-st.dataframe(df.head(), use_container_width=True)
-st.write(f"行数: **{len(df)}**  列数: **{df.shape[1]}**")
+    # 説明変数エンコード
+    X, _ = encode_features(work_df, selected_features)
 
-# ---------- 列選択 ----------
-all_cols = df.columns.tolist()
-if len(all_cols) < 2:
-    st.error("列が不足しています。CSVを確認してください。")
-    st.stop()
+    # 学習
+    X_train, X_test, y_train, y_test = train_test_split(
+        X.values, y, test_size=0.2, random_state=random_state, stratify=y
+    )
+    clf = DecisionTreeClassifier(
+        criterion=criterion, max_depth=depth, random_state=random_state
+    )
+    clf.fit(X_train, y_train)
 
-default_target = "target" if "target" in all_cols else all_cols[-1]
-target_col = st.selectbox("🎯 目的変数（分類クラス）", all_cols, index=all_cols.index(default_target))
+    # 評価
+    y_pred = clf.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    st.markdown(f"**Accuracy:** `{acc:.4f}`")
 
-feature_candidates = [c for c in all_cols if c != target_col]
+    rep = classification_report(y_test, y_pred, target_names=class_names, zero_division=0)
+    st.code(rep, language="text")
 
-# 「全選択/全解除」ボタン（セッションステートで保持）
-if "feature_selection" not in st.session_state:
-    st.session_state.feature_selection = feature_candidates.copy()
+    cm = confusion_matrix(y_test, y_pred, labels=list(range(len(class_names))))
+    fig_cm, ax_cm = plt.subplots(figsize=(5 + 0.5*len(class_names), 5 + 0.5*len(class_names)))
+    im = ax_cm.imshow(cm, interpolation="nearest")
+    ax_cm.set_title("Confusion Matrix")
+    ax_cm.set_xticks(range(len(class_names)))
+    ax_cm.set_yticks(range(len(class_names)))
+    ax_cm.set_xticklabels(class_names, rotation=45, ha="right")
+    ax_cm.set_yticklabels(class_names)
+    for (i, j), v in np.ndenumerate(cm):
+        ax_cm.text(j, i, str(v), ha='center', va='center')
+    fig_cm.colorbar(im, ax=ax_cm, fraction=0.046, pad=0.04)
+    st.pyplot(fig_cm, use_container_width=True)
 
-col_a, col_b = st.columns(2)
-with col_a:
-    if st.button("🟩 全特徴量を選択"):
-        st.session_state.feature_selection = feature_candidates.copy()
-with col_b:
-    if st.button("⬜ 全解除"):
-        st.session_state.feature_selection = []
+    # 決定木の可視化（ダウンロードは提供しない）
+    st.markdown("### 決定木（可視化）")
+    fig_tree, ax_tree = plt.subplots(figsize=(min(24, 1.5*len(selected_features)+6), 8))
+    plot_tree(
+        clf,
+        feature_names=selected_features,
+        class_names=class_names,
+        filled=True,
+        rounded=True,
+        impurity=True,
+        fontsize=10,
+        ax=ax_tree
+    )
+    st.pyplot(fig_tree, use_container_width=True)
 
-selected_features = st.multiselect(
-    "🧮 使用する特徴量（複数選択）",
-    options=feature_candidates,
-    default=st.session_state.feature_selection,
-    key="feature_selection",
-)
+    # 特徴量重要度
+    st.markdown("### 特徴量の重要度")
+    importances = clf.feature_importances_
+    imp_df = pd.DataFrame({"feature": selected_features, "importance": importances}).sort_values("importance", ascending=False)
+    st.dataframe(imp_df, use_container_width=True)
 
-if len(selected_features) == 0:
-    st.warning("少なくとも1つの特徴量を選んでください。")
-    st.stop()
+    if st.button("◀ 設定に戻る"):
+        st.session_state.step = 3
 
-# 欠損処理（簡易）：目的変数と選択特徴量に欠損がある行を除外
-work_df = df[selected_features + [target_col]].dropna()
-dropped = len(df) - len(work_df)
-if dropped > 0:
-    st.caption(f"⚠️ 欠損を含む {dropped} 行を削除しました（学習対象 {len(work_df)} 行）。")
-
-# 目的変数の連続値チェック & エンコード
-y_raw = work_df[target_col]
-y, y_encoder, class_names = encode_target(y_raw)
-
-if y is None:
-    st.error("目的変数が連続値（クラス数が多すぎ）に見えます。分類木には**カテゴリ変数**を指定してください。")
-    st.stop()
-
-X, x_encoders = encode_features(work_df, selected_features)
-
-# ---------- モデル設定 ----------
-st.sidebar.header("🛠️ モデル設定")
-criterion = st.sidebar.selectbox("不純度指標", ["gini", "entropy", "log_loss"], index=0)
-max_depth = st.sidebar.slider("最大深さ（0=制限なし）", 0, 20, 3)
-test_size = st.sidebar.slider("テストサイズ（割合）", 0.1, 0.5, 0.2, step=0.05)
-random_state = st.sidebar.number_input("random_state", 0, 9999, 0, step=1)
-use_class_weight = st.sidebar.checkbox("クラス不均衡対策（class_weight='balanced')", value=False)
-
-depth = None if max_depth == 0 else max_depth
-class_weight = "balanced" if use_class_weight else None
-
-# ---------- 学習 ----------
-X_train, X_test, y_train, y_test = train_test_split(
-    X.values, y, test_size=test_size, random_state=random_state, stratify=y
-)
-
-clf = DecisionTreeClassifier(
-    criterion=criterion,
-    max_depth=depth,
-    random_state=random_state,
-    class_weight=class_weight,
-)
-clf.fit(X_train, y_train)
-
-# ---------- 評価 ----------
-y_pred = clf.predict(X_test)
-acc = accuracy_score(y_test, y_pred)
-
-st.subheader("📊 評価")
-st.write(f"**Accuracy:** {acc:.4f}")
-
-rep = classification_report(y_test, y_pred, target_names=class_names, output_dict=False, zero_division=0)
-st.code(rep)
-
-# 混同行列（画像）
-cm = confusion_matrix(y_test, y_pred, labels=list(range(len(class_names))))
-fig_cm, ax_cm = plt.subplots(figsize=(4 + 0.4*len(class_names), 4 + 0.4*len(class_names)))
-im = ax_cm.imshow(cm, interpolation="nearest")
-ax_cm.set_title("Confusion Matrix")
-ax_cm.set_xticks(range(len(class_names)))
-ax_cm.set_yticks(range(len(class_names)))
-ax_cm.set_xticklabels(class_names, rotation=45, ha="right")
-ax_cm.set_yticklabels(class_names)
-for (i, j), v in np.ndenumerate(cm):
-    ax_cm.text(j, i, str(v), ha='center', va='center')
-fig_cm.colorbar(im, ax=ax_cm, fraction=0.046, pad=0.04)
-st.pyplot(fig_cm, use_container_width=True)
-
-# ---------- 決定木の可視化（matplotlib） ----------
-st.subheader("🌳 決定木（matplotlib）")
-fig, ax = plt.subplots(figsize=(min(24, 1.2*len(selected_features)+8), 8))
-plot_tree(
-    clf,
-    feature_names=selected_features,
-    class_names=class_names,
-    filled=True,
-    rounded=True,
-    impurity=True,
-    fontsize=10,
-    ax=ax
-)
-st.pyplot(fig, use_container_width=True)
-
-# PNG ダウンロード
-buf = BytesIO()
-fig.savefig(buf, format="png", bbox_inches="tight", dpi=200)
-png_bytes = buf.getvalue()
-st.download_button(
-    "📥 決定木PNGをダウンロード",
-    data=png_bytes,
-    file_name="decision_tree.png",
-    mime="image/png"
-)
-
-# Graphviz DOT 文字列（画像化はしないが、後で使える）
-dot_str = export_graphviz(
-    clf,
-    out_file=None,
-    feature_names=selected_features,
-    class_names=class_names,
-    filled=True,
-    rounded=True,
-    special_characters=True
-)
-st.download_button(
-    "📥 Graphviz DOT をダウンロード",
-    data=dot_str.encode("utf-8"),
-    file_name="decision_tree.dot",
-    mime="text/plain"
-)
-
-# ---------- 重要度 ----------
-st.subheader("🏷️ 特徴量の重要度")
-importances = clf.feature_importances_
-imp_df = pd.DataFrame({"feature": selected_features, "importance": importances}).sort_values("importance", ascending=False)
-st.dataframe(imp_df, use_container_width=True)
-
-fig_imp, ax_imp = plt.subplots(figsize=(8, max(3, 0.4*len(selected_features))))
-ax_imp.barh(imp_df["feature"], imp_df["importance"])
-ax_imp.invert_yaxis()
-ax_imp.set_xlabel("Importance")
-st.pyplot(fig_imp, use_container_width=True)
-
-# ---------- エンコードの注意 ----------
-with st.expander("ℹ️ ラベルエンコードの対応（自動処理の説明）"):
-    st.markdown("""
-- 文字列の**特徴量**は LabelEncoder により 0..K-1 に自動変換しています  
-- 目的変数（ターゲット）が文字列なら自動でクラスに変換します  
-- 目的変数が数値でもクラス数が20以下なら**離散クラス**とみなして学習します  
-- **多数の連続値**がある目的変数は分類木に不向きです（回帰木を使うのが望ましい）
-""")
-    if y_encoder is not None:
-        map_df = pd.DataFrame({"class_index": list(range(len(y_encoder.classes_))),
-                               "class_label": y_encoder.classes_})
-        st.caption("目的変数のラベル→クラス番号 対応表")
-        st.dataframe(map_df, use_container_width=True)
